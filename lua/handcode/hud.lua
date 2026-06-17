@@ -1,17 +1,30 @@
+--- handcode/hud.lua
+--- Floating HUD window showing active sessions and remaining ghost counts.
+
 local M = {}
 
 M.win_id = nil
-M.bufnr = nil
+M.bufnr  = nil
 
--- Config settings (loaded from setup)
 M.config = {
-  enabled = true,
-  position = "top_right",
-  border = "rounded",
+  enabled   = true,
+  position  = "top_right",
+  border    = "rounded",
   max_width = 30,
 }
 
----Update the HUD window contents and visibility
+-- Namespace created once — fixes the leak from creating it on every update()
+local HUD_HL_NS = vim.api.nvim_create_namespace("handcode_hud_hl")
+
+---Close the HUD window.
+function M.close()
+  if M.win_id and vim.api.nvim_win_is_valid(M.win_id) then
+    pcall(vim.api.nvim_win_close, M.win_id, true)
+  end
+  M.win_id = nil
+end
+
+---Update (or open) the HUD window with current session stats.
 function M.update()
   if not M.config.enabled then
     M.close()
@@ -19,120 +32,84 @@ function M.update()
   end
 
   local state = require("handcode.state")
-  local active_sessions = {}
+  local active = {}
 
-  for bufnr, session in pairs(state.sessions) do
-    local has_active_hunks = false
+  for _, session in pairs(state.sessions) do
     for _, hunk in ipairs(session.ghost_hunks) do
       if not hunk.resolved then
-        has_active_hunks = true
+        table.insert(active, session)
         break
       end
     end
-    if has_active_hunks then
-      table.insert(active_sessions, session)
-    end
   end
 
-  -- If no active sessions, close HUD and exit
-  if #active_sessions == 0 then
+  if #active == 0 then
     M.close()
     return
   end
 
-  -- Prepare lines to display
+  -- Build display lines
   local lines = {
     "  HANDCODE MODE ",
     " ────────────────",
   }
-  local max_width = 18 -- min width
+  local computed_width = 18
 
-  for _, session in ipairs(active_sessions) do
-    local add_left = 0
-    local del_left = 0
+  for _, session in ipairs(active) do
+    local adds, dels = 0, 0
     for _, hunk in ipairs(session.ghost_hunks) do
       if not hunk.resolved then
-        -- Count un-solidified additions
         for i = 1, #hunk.additions do
-          if not hunk.solidified_lines[i] then
-            add_left = add_left + 1
-          end
+          if not hunk.solidified_lines[i] then adds = adds + 1 end
         end
-        del_left = del_left + #hunk.deletions
+        dels = dels + #hunk.deletions
       end
     end
 
-    table.insert(lines, "  " .. session.file)
-    local status_line = string.format("    %d additions   %d deletions", add_left, del_left)
-    table.insert(lines, status_line)
-
-    max_width = math.max(max_width, #session.file + 5, #status_line + 2)
+    local fname      = "  " .. session.file
+    local stat_line  = string.format("    +%d  -%d", adds, dels)
+    table.insert(lines, fname)
+    table.insert(lines, stat_line)
+    computed_width = math.max(computed_width, #fname + 2, #stat_line + 2)
   end
 
-  -- Clamp width to max_width configuration
-  max_width = math.min(max_width, M.config.max_width)
+  local width = math.min(computed_width, M.config.max_width)
 
-  -- Create buffer if not exists
+  -- Ensure scratch buffer exists
   if not M.bufnr or not vim.api.nvim_buf_is_valid(M.bufnr) then
     M.bufnr = vim.api.nvim_create_buf(false, true)
     vim.bo[M.bufnr].bufhidden = "hide"
   end
 
-  -- Write lines to buffer
   vim.api.nvim_buf_set_lines(M.bufnr, 0, -1, false, lines)
 
-  -- Apply syntax highlighting to HUD
-  local ns = vim.api.nvim_create_namespace("handcode_hud_hl")
-  vim.api.nvim_buf_clear_namespace(M.bufnr, ns, 0, -1)
-  vim.api.nvim_buf_add_highlight(M.bufnr, ns, "Title", 0, 0, -1)
-  vim.api.nvim_buf_add_highlight(M.bufnr, ns, "Comment", 1, 0, -1)
+  -- Apply highlights
+  vim.api.nvim_buf_clear_namespace(M.bufnr, HUD_HL_NS, 0, -1)
+  vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Title",   0, 0, -1)
+  vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Comment", 1, 0, -1)
 
-  local line_idx = 2
-  for _ = 1, #active_sessions do
-    -- File name highlighting
-    vim.api.nvim_buf_add_highlight(M.bufnr, ns, "Directory", line_idx, 0, -1)
-
-    -- Status line parsing for coloring
-    local status = lines[line_idx + 1]
-    local add_start = status:find("")
-    local del_start = status:find("")
-
-    if add_start then
-      local add_end = status:find("additions")
-      if add_end then
-        vim.api.nvim_buf_add_highlight(M.bufnr, ns, "DiagnosticOk", line_idx + 1, add_start - 1, add_end + 9)
-      end
-    end
-
-    if del_start then
-      local del_end = status:find("deletions")
-      if del_end then
-        vim.api.nvim_buf_add_highlight(M.bufnr, ns, "DiagnosticError", line_idx + 1, del_start - 1, del_end + 9)
-      end
-    end
-
-    line_idx = line_idx + 2
+  local li = 2
+  for _ = 1, #active do
+    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Directory",    li,     0, -1)
+    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "DiagnosticOk", li + 1, 0, -1)
+    li = li + 2
   end
 
-  -- Configure window properties
-  local width = max_width
-  local height = #lines
+  -- Window config
   local col = (M.config.position == "top_right") and (vim.o.columns - width - 3) or 3
-  local row = 1
-
   local win_opts = {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = col,
-    row = row,
-    anchor = (M.config.position == "top_right") and "NE" or "NW",
-    style = "minimal",
-    border = M.config.border,
+    relative  = "editor",
+    width     = width,
+    height    = #lines,
+    col       = col,
+    row       = 1,
+    anchor    = (M.config.position == "top_right") and "NE" or "NW",
+    style     = "minimal",
+    border    = M.config.border,
     focusable = false,
+    zindex    = 50,
   }
 
-  -- Open or update window
   if not M.win_id or not vim.api.nvim_win_is_valid(M.win_id) then
     M.win_id = vim.api.nvim_open_win(M.bufnr, false, win_opts)
   else
@@ -140,15 +117,7 @@ function M.update()
   end
 end
 
----Close the HUD window
-function M.close()
-  if M.win_id and vim.api.nvim_win_is_valid(M.win_id) then
-    vim.api.nvim_win_close(M.win_id, true)
-  end
-  M.win_id = nil
-end
-
----Toggle HUD display configuration
+---Toggle the HUD on/off.
 function M.toggle()
   M.config.enabled = not M.config.enabled
   M.update()
