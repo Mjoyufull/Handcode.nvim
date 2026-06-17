@@ -23,6 +23,7 @@ M.config = {
     opencode_events = true,  -- hook into OpencodeEvent:* autocmds
     fs_watch        = true,  -- vim.uv.fs_event per buffer
     buf_enter       = true,  -- BufEnter / FocusGained fallback
+    auto_follow     = false, -- automatically switch to edited files (breaks workflow)
   },
 }
 

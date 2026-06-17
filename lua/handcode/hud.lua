@@ -34,12 +34,16 @@ function M.update()
   local state = require("handcode.state")
   local active = {}
 
-  for _, session in pairs(state.sessions) do
+  for bufnr, session in pairs(state.sessions) do
+    local has_unresolved = false
     for _, hunk in ipairs(session.ghost_hunks) do
       if not hunk.resolved then
-        table.insert(active, session)
+        has_unresolved = true
         break
       end
+    end
+    if has_unresolved then
+      table.insert(active, { bufnr = bufnr, session = session })
     end
   end
 
@@ -55,10 +59,23 @@ function M.update()
   }
   local computed_width = 18
 
-  for _, session in ipairs(active) do
+  for _, item in ipairs(active) do
+    local session = item.session
     local adds, dels = 0, 0
+    local line_ranges = {}
+    
     for _, hunk in ipairs(session.ghost_hunks) do
       if not hunk.resolved then
+        -- Get extmark position to show line numbers
+        local pos = vim.api.nvim_buf_get_extmark_by_id(
+          item.bufnr, state.ns_id, hunk.extmark_id, {}
+        )
+        if pos and pos[1] then
+          local start_line = pos[1] + 1  -- convert to 1-indexed
+          local end_line = start_line + math.max(#hunk.additions, #hunk.deletions) - 1
+          table.insert(line_ranges, string.format("L%d-%d", start_line, end_line))
+        end
+        
         for i = 1, #hunk.additions do
           if not hunk.solidified_lines[i] then adds = adds + 1 end
         end
@@ -66,11 +83,18 @@ function M.update()
       end
     end
 
-    local fname      = "  " .. session.file
-    local stat_line  = string.format("    +%d  -%d", adds, dels)
+    local fname = "  " .. session.file
+    local ranges = "    " .. table.concat(line_ranges, ", ")
+    local stat_line = string.format("    +%d  -%d", adds, dels)
+    
     table.insert(lines, fname)
+    if #line_ranges > 0 then
+      table.insert(lines, ranges)
+    end
     table.insert(lines, stat_line)
-    computed_width = math.max(computed_width, #fname + 2, #stat_line + 2)
+    table.insert(lines, "")  -- spacer
+    
+    computed_width = math.max(computed_width, #fname + 2, #ranges + 2, #stat_line + 2)
   end
 
   local width = math.min(computed_width, M.config.max_width)
@@ -90,9 +114,10 @@ function M.update()
 
   local li = 2
   for _ = 1, #active do
-    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Directory",    li,     0, -1)
-    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "DiagnosticOk", li + 1, 0, -1)
-    li = li + 2
+    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Directory",     li,     0, -1)  -- filename
+    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Number",        li + 1, 0, -1)  -- line ranges
+    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "DiagnosticOk",  li + 2, 0, -1)  -- stats
+    li = li + 4  -- filename + ranges + stats + spacer
   end
 
   -- Window config

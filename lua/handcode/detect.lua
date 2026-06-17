@@ -22,9 +22,13 @@ local function try_start(bufnr)
 
   local filepath = vim.api.nvim_buf_get_name(bufnr)
   if filepath == "" then return end
+  
+  -- Check if file exists on disk
+  if vim.fn.filereadable(filepath) == 0 then return end
 
   local hunks = require("handcode.diff").get_file_diff(filepath)
   if hunks and #hunks > 0 then
+    vim.notify("Handcode: detected changes in " .. vim.fn.fnamemodify(filepath, ":t"), vim.log.levels.INFO)
     require("handcode").start(bufnr)
   end
 end
@@ -80,19 +84,49 @@ function M.setup(config)
       group = group,
       pattern = "OpencodeEvent:file.edited",
       desc = "Handcode: start session after opencode file edit",
-      callback = function()
+      callback = function(args)
+        -- Extract the filepath from the event data if available
+        local edited_file = args.data and args.data.event 
+          and args.data.event.properties 
+          and args.data.event.properties.file
+
         -- Defer so opencode.nvim's :checktime reload runs first
-        vim.schedule(function()
-          -- Try the current buffer; opencode.nvim reloads whatever :checktime finds
+        vim.defer_fn(function()
+          -- If we know which file was edited, ensure buffer is loaded
+          if edited_file and vim.fn.filereadable(edited_file) == 1 then
+            local target_bufnr = vim.fn.bufnr(edited_file)
+            
+            if target_bufnr == -1 then
+              -- Buffer doesn't exist yet - create it
+              target_bufnr = vim.fn.bufadd(edited_file)
+              vim.fn.bufload(target_bufnr)
+              
+              -- Only auto-switch if configured to do so
+              if det.auto_follow then
+                vim.cmd("buffer " .. target_bufnr)
+              end
+            elseif not vim.api.nvim_buf_is_loaded(target_bufnr) then
+              -- Buffer exists but isn't loaded
+              vim.fn.bufload(target_bufnr)
+            end
+            
+            -- Try to start handcode on this buffer after a small delay
+            vim.defer_fn(function()
+              try_start(target_bufnr)
+            end, 100)
+          end
+          
+          -- Also try the current buffer
           local bufnr = vim.api.nvim_get_current_buf()
           try_start(bufnr)
-          -- Also scan all loaded buffers in case the AI edited a background file
+          
+          -- Scan all other loaded buffers for changes
           for _, b in ipairs(vim.api.nvim_list_bufs()) do
             if b ~= bufnr and vim.api.nvim_buf_is_loaded(b) then
               try_start(b)
             end
           end
-        end)
+        end, 200)
       end,
     })
 

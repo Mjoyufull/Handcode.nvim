@@ -60,32 +60,44 @@ end
 ---@param filepath string
 ---@return handcode.Hunk[]?
 function M.get_file_diff(filepath)
+  -- First check if we're in a git repo
+  local git_root = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })
+  if vim.v.shell_error ~= 0 then
+    return nil
+  end
+
+  -- Check if the file is untracked
+  local status = vim.fn.systemlist({ "git", "status", "--porcelain", filepath })
+  if #status > 0 and status[1]:match("^%?%?") then
+    -- Untracked file: the entire file is an addition!
+    local lines = vim.fn.readfile(filepath)
+    if #lines == 0 then return nil end  -- empty file
+    return {
+      {
+        del_start = 1,
+        del_len = 0,
+        add_start = 1,
+        add_len = #lines,
+        deletions = {},
+        additions = lines,
+      }
+    }
+  end
+
   -- Run git diff -U0 --relative
   local cmd = { "git", "diff", "-U0", "--relative", filepath }
   local output = vim.fn.systemlist(cmd)
 
   if vim.v.shell_error ~= 0 then
-    -- Let's check if the file is untracked
-    local status = vim.fn.systemlist({ "git", "status", "--porcelain", filepath })
-    if #status > 0 and status[1]:match("^%?%?") then
-      -- Untracked file: the entire file is an addition!
-      local lines = vim.fn.readfile(filepath)
-      return {
-        {
-          del_start = 1,
-          del_len = 0,
-          add_start = 1,
-          add_len = #lines,
-          deletions = {},
-          additions = lines,
-        }
-      }
-    end
-    vim.notify("Handcode: git diff failed or not a git repository", vim.log.levels.WARN)
     return nil
   end
 
-  return M.parse_diff(output)
+  local hunks = M.parse_diff(output)
+  if not hunks or #hunks == 0 then
+    return nil
+  end
+
+  return hunks
 end
 
 return M
