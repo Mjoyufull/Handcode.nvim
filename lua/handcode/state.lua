@@ -290,8 +290,7 @@ function M.start_session(bufnr)
 
     -- Extmark for the addition block (stays at its row even as text is inserted above)
     local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, M.ns_id, add_start_row, 0, {
-      right_gravity     = false,
-      end_right_gravity = false,
+      right_gravity = false,
     })
 
     -- Extmark + highlight for deletion block

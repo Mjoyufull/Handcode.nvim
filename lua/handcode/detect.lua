@@ -28,7 +28,6 @@ local function try_start(bufnr)
 
   local hunks = require("handcode.diff").get_file_diff(filepath)
   if hunks and #hunks > 0 then
-    vim.notify("Handcode: detected changes in " .. vim.fn.fnamemodify(filepath, ":t"), vim.log.levels.INFO)
     require("handcode").start(bufnr)
   end
 end
