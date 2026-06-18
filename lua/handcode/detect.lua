@@ -11,6 +11,77 @@ local M = {}
 ---@type table<number, uv_fs_event_t>  bufnr -> active watcher handle
 local watchers = {}
 
+---@param filepath string
+---@return string
+local function normalize_path(filepath)
+  return vim.fn.fnamemodify(filepath, ":p")
+end
+
+---@param filepath string
+---@return number
+local function find_or_load_buf(filepath)
+  local target = normalize_path(filepath)
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    if name ~= "" and normalize_path(name) == target then
+      if not vim.api.nvim_buf_is_loaded(bufnr) then
+        vim.fn.bufload(bufnr)
+      end
+      return bufnr
+    end
+  end
+
+  local bufnr = vim.fn.bufadd(target)
+  vim.fn.bufload(bufnr)
+  return bufnr
+end
+
+---@param bufnr number
+local function checktime(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then return end
+  pcall(vim.cmd, "silent! checktime " .. bufnr)
+end
+
+---@param event table?
+---@return string?
+local function event_filepath(event)
+  local props = event and event.properties or nil
+  if not props then return nil end
+
+  for _, key in ipairs({ "file", "path", "filepath", "filePath" }) do
+    local value = props[key]
+    if type(value) == "string" and value ~= "" then
+      return value
+    end
+    if type(value) == "table" then
+      for _, nested_key in ipairs({ "path", "absolute", "filename", "name" }) do
+        local nested = value[nested_key]
+        if type(nested) == "string" and nested ~= "" then
+          return nested
+        end
+      end
+    end
+  end
+
+  return nil
+end
+
+---@param filepath string
+---@return string
+local function resolve_event_filepath(filepath)
+  if filepath:sub(1, 1) == "/" then
+    return filepath
+  end
+
+  local ok, server_mod = pcall(require, "opencode.server")
+  local connected = ok and server_mod.connected or nil
+  if connected and connected.cwd and connected.cwd ~= "" then
+    return connected.cwd:gsub("/$", "") .. "/" .. filepath
+  end
+
+  return filepath
+end
+
 ---Attempt to start a Handcode session on bufnr if it has new diff and no active session.
 ---@param bufnr number
 local function try_start(bufnr)
@@ -22,7 +93,7 @@ local function try_start(bufnr)
 
   local filepath = vim.api.nvim_buf_get_name(bufnr)
   if filepath == "" then return end
-  
+
   -- Check if file exists on disk
   if vim.fn.filereadable(filepath) == 0 then return end
 
@@ -31,6 +102,8 @@ local function try_start(bufnr)
     require("handcode").start(bufnr)
   end
 end
+
+M.try_start = try_start
 
 ---Register a libuv fs_event watcher for a buffer's file.
 ---Fires try_start when the file is modified on disk.
@@ -44,17 +117,18 @@ function M.watch_buf(bufnr)
   local handle = vim.uv.new_fs_event()
   if not handle then return end
 
-  local ok, err = handle:start(filepath, {}, vim.schedule_wrap(function(fs_err, _, events)
+  local ok = handle:start(filepath, {}, vim.schedule_wrap(function(fs_err, _, events)
     if fs_err then return end
     if not (events and events.change) then return end
-    -- Small defer so that :checktime / autoread can reload the buffer first
+    checktime(bufnr)
     vim.defer_fn(function()
       try_start(bufnr)
     end, 60)
   end))
 
   if not ok then
-    handle:stop()
+    pcall(function() handle:stop() end)
+    pcall(function() handle:close() end)
     return
   end
 
@@ -67,6 +141,7 @@ function M.unwatch_buf(bufnr)
   local handle = watchers[bufnr]
   if not handle then return end
   pcall(function() handle:stop() end)
+  pcall(function() handle:close() end)
   watchers[bufnr] = nil
 end
 
@@ -84,44 +159,37 @@ function M.setup(config)
       pattern = "OpencodeEvent:file.edited",
       desc = "Handcode: start session after opencode file edit",
       callback = function(args)
-        -- Extract the filepath from the event data if available
-        local edited_file = args.data and args.data.event 
-          and args.data.event.properties 
-          and args.data.event.properties.file
+        local edited_file = event_filepath(args.data and args.data.event)
+        if edited_file then
+          edited_file = resolve_event_filepath(edited_file)
+        end
 
         -- Defer so opencode.nvim's :checktime reload runs first
         vim.defer_fn(function()
           -- If we know which file was edited, ensure buffer is loaded
           if edited_file and vim.fn.filereadable(edited_file) == 1 then
-            local target_bufnr = vim.fn.bufnr(edited_file)
-            
-            if target_bufnr == -1 then
-              -- Buffer doesn't exist yet - create it
-              target_bufnr = vim.fn.bufadd(edited_file)
-              vim.fn.bufload(target_bufnr)
-              
-              -- Only auto-switch if configured to do so
-              if det.auto_follow then
-                vim.cmd("buffer " .. target_bufnr)
-              end
-            elseif not vim.api.nvim_buf_is_loaded(target_bufnr) then
-              -- Buffer exists but isn't loaded
-              vim.fn.bufload(target_bufnr)
+            local target_bufnr = find_or_load_buf(edited_file)
+            checktime(target_bufnr)
+
+            if det.auto_follow then
+              vim.api.nvim_set_current_buf(target_bufnr)
             end
-            
+
             -- Try to start handcode on this buffer after a small delay
             vim.defer_fn(function()
               try_start(target_bufnr)
             end, 100)
           end
-          
+
           -- Also try the current buffer
           local bufnr = vim.api.nvim_get_current_buf()
+          checktime(bufnr)
           try_start(bufnr)
-          
+
           -- Scan all other loaded buffers for changes
           for _, b in ipairs(vim.api.nvim_list_bufs()) do
             if b ~= bufnr and vim.api.nvim_buf_is_loaded(b) then
+              checktime(b)
               try_start(b)
             end
           end
@@ -132,7 +200,7 @@ function M.setup(config)
     -- ── 2. opencode.nvim: end-of-turn sweep ───────────────────────────────
     vim.api.nvim_create_autocmd("User", {
       group = group,
-      pattern = "OpencodeEvent:session.status",
+      pattern = { "OpencodeEvent:session.status", "OpencodeEvent:session.idle" },
       desc = "Handcode: sweep all buffers when opencode goes idle",
       callback = function(args)
         local event = args.data and args.data.event
@@ -140,11 +208,12 @@ function M.setup(config)
         local status = event.properties
           and event.properties.status
           and event.properties.status.type
-        if status ~= "idle" then return end
+        if event.type ~= "session.idle" and status ~= "idle" then return end
 
         vim.schedule(function()
           for _, b in ipairs(vim.api.nvim_list_bufs()) do
             if vim.api.nvim_buf_is_loaded(b) then
+              checktime(b)
               try_start(b)
             end
           end
@@ -174,6 +243,14 @@ function M.setup(config)
         M.unwatch_buf(ev.buf)
       end,
     })
+
+    vim.schedule(function()
+      for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(bufnr) and vim.api.nvim_buf_get_name(bufnr) ~= "" then
+          M.watch_buf(bufnr)
+        end
+      end
+    end)
   end
 
   -- ── 4. BufEnter / FocusGained fallback ──────────────────────────────────
@@ -183,7 +260,8 @@ function M.setup(config)
       desc = "Handcode: fallback check on focus/buffer switch",
       callback = function(ev)
         vim.defer_fn(function()
-          local bufnr = ev.buf ~= 0 and ev.buf or vim.api.nvim_get_current_buf()
+          local bufnr = ev.buf and ev.buf ~= 0 and ev.buf or vim.api.nvim_get_current_buf()
+          checktime(bufnr)
           try_start(bufnr)
         end, 150)
       end,

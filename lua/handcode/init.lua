@@ -5,8 +5,8 @@ local M = {}
 
 M.config = {
   hl_groups = {
-    ghost  = "HandcodeGhost",
-    delete = "HandcodeDelete",
+    ghost  = "Comment",
+    delete = "DiffDelete",
   },
   hud = {
     enabled   = true,
@@ -27,6 +27,16 @@ M.config = {
   },
 }
 
+---@param group string
+---@param fallback string
+---@return string
+local function resolve_highlight_link(group, fallback)
+  if group == "HandcodeGhost" or group == "HandcodeDelete" then
+    return fallback
+  end
+  return group
+end
+
 ---@param opts table?
 function M.setup(opts)
   if opts then
@@ -38,8 +48,12 @@ function M.setup(opts)
   end
 
   -- Highlights
-  vim.api.nvim_set_hl(0, "HandcodeGhost",  { link = M.config.hl_groups.ghost,  default = true })
-  vim.api.nvim_set_hl(0, "HandcodeDelete", { link = M.config.hl_groups.delete, default = true })
+  vim.api.nvim_set_hl(0, "HandcodeGhost", {
+    link = resolve_highlight_link(M.config.hl_groups.ghost, "Comment"),
+  })
+  vim.api.nvim_set_hl(0, "HandcodeDelete", {
+    link = resolve_highlight_link(M.config.hl_groups.delete, "DiffDelete"),
+  })
 
   -- HUD config
   require("handcode.hud").config = M.config.hud
@@ -47,15 +61,17 @@ function M.setup(opts)
   -- Detection layer
   require("handcode.detect").setup(M.config)
 
-  -- User commands
+  -- User commands. setup() may run once from plugin/handcode.lua and again from
+  -- user config, so command creation must be idempotent.
   vim.api.nvim_create_user_command("Handcode", function(args)
     local sub = args.fargs[1] or "toggle"
-    if     sub == "start"         then M.start()
-    elseif sub == "stop"          then M.stop(args.fargs[2] == "restore")
-    elseif sub == "toggle"        then M.toggle()
-    elseif sub == "complete_line" then M.complete_line()
-    elseif sub == "complete_hunk" then M.complete_hunk()
-    elseif sub == "complete_file" then M.complete_file()
+    if     sub == "start"          then M.start()
+    elseif sub == "stop"           then M.stop(args.fargs[2] == "restore")
+    elseif sub == "toggle"         then M.toggle()
+    elseif sub == "complete_line"  then M.complete_line()
+    elseif sub == "complete_hunk"  then M.complete_hunk()
+    elseif sub == "complete_range" then M.complete_range(args.line1, args.line2)
+    elseif sub == "complete_file"  then M.complete_file()
     else
       vim.notify(
         "Handcode: unknown subcommand '" .. sub .. "'",
@@ -64,14 +80,16 @@ function M.setup(opts)
     end
   end, {
     nargs    = "*",
+    range    = true,
+    force    = true,
     complete = function()
-      return { "start", "stop", "toggle", "complete_line", "complete_hunk", "complete_file" }
+      return { "start", "stop", "toggle", "complete_line", "complete_hunk", "complete_range", "complete_file" }
     end,
   })
 
   vim.api.nvim_create_user_command("HandcodeCompleteRange", function(a)
     M.complete_range(a.line1, a.line2)
-  end, { range = true })
+  end, { range = true, force = true })
 end
 
 -- ─── session control ─────────────────────────────────────────────────────────
@@ -79,7 +97,9 @@ end
 ---Start a Handcode session on bufnr (defaults to current buffer).
 ---@param bufnr number?
 function M.start(bufnr)
-  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not bufnr or bufnr == 0 then
+    bufnr = vim.api.nvim_get_current_buf()
+  end
   local state = require("handcode.state")
   state.start_session(bufnr)
 

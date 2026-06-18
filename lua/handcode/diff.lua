@@ -56,22 +56,43 @@ function M.parse_diff(diff_lines)
   return hunks
 end
 
+---@param filepath string
+---@return string?, string?
+local function git_context(filepath)
+  local absolute = vim.fn.fnamemodify(filepath, ":p")
+  local dir = vim.fn.fnamemodify(absolute, ":h")
+  local root = vim.fn.systemlist({ "git", "-C", dir, "rev-parse", "--show-toplevel" })
+  if vim.v.shell_error ~= 0 or not root[1] or root[1] == "" then
+    return nil, nil
+  end
+
+  local relative = vim.fn.fnamemodify(absolute, ":.")
+  local from_root = vim.fn.systemlist({ "git", "-C", root[1], "ls-files", "--full-name", "--", absolute })
+  if vim.v.shell_error == 0 and from_root[1] and from_root[1] ~= "" then
+    relative = from_root[1]
+  else
+    local prefix = root[1]:gsub("/$", "") .. "/"
+    relative = absolute:sub(1, #prefix) == prefix and absolute:sub(#prefix + 1) or absolute
+  end
+
+  return root[1], relative
+end
+
 ---Get diff for a file using git
 ---@param filepath string
 ---@return handcode.Hunk[]?
 function M.get_file_diff(filepath)
-  -- First check if we're in a git repo
-  local git_root = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })
-  if vim.v.shell_error ~= 0 then
+  local git_root, relative_path = git_context(filepath)
+  if not git_root or not relative_path then
     return nil
   end
 
   -- Check if the file is untracked
-  local status = vim.fn.systemlist({ "git", "status", "--porcelain", filepath })
+  local status = vim.fn.systemlist({ "git", "-C", git_root, "status", "--porcelain", "--", relative_path })
   if #status > 0 and status[1]:match("^%?%?") then
     -- Untracked file: the entire file is an addition!
     local lines = vim.fn.readfile(filepath)
-    if #lines == 0 then return nil end  -- empty file
+    if #lines == 0 then return nil end -- empty file
     return {
       {
         del_start = 1,
@@ -80,12 +101,12 @@ function M.get_file_diff(filepath)
         add_len = #lines,
         deletions = {},
         additions = lines,
-      }
+      },
     }
   end
 
   -- Run git diff -U0 --relative
-  local cmd = { "git", "diff", "-U0", "--relative", filepath }
+  local cmd = { "git", "-C", git_root, "diff", "-U0", "--", relative_path }
   local output = vim.fn.systemlist(cmd)
 
   if vim.v.shell_error ~= 0 then

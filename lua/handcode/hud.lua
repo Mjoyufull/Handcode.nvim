@@ -16,6 +16,15 @@ M.config = {
 -- Namespace created once — fixes the leak from creating it on every update()
 local HUD_HL_NS = vim.api.nvim_create_namespace("handcode_hud_hl")
 
+---@param text string
+---@param width number
+---@return string
+local function fit(text, width)
+  if #text <= width then return text end
+  if width <= 1 then return text:sub(1, width) end
+  return text:sub(1, width - 1) .. "…"
+end
+
 ---Close the HUD window.
 function M.close()
   if M.win_id and vim.api.nvim_win_is_valid(M.win_id) then
@@ -57,6 +66,10 @@ function M.update()
     "  HANDCODE MODE ",
     " ────────────────",
   }
+  local highlights = {
+    { line = 0, group = "Title" },
+    { line = 1, group = "Comment" },
+  }
   local computed_width = 18
 
   for _, item in ipairs(active) do
@@ -86,18 +99,27 @@ function M.update()
     local fname = "  " .. session.file
     local ranges = "    " .. table.concat(line_ranges, ", ")
     local stat_line = string.format("    +%d  -%d", adds, dels)
-    
+
+    local filename_line = #lines
     table.insert(lines, fname)
+    table.insert(highlights, { line = filename_line, group = "Directory" })
     if #line_ranges > 0 then
+      local range_line = #lines
       table.insert(lines, ranges)
+      table.insert(highlights, { line = range_line, group = "Number" })
     end
+    local stats_line = #lines
     table.insert(lines, stat_line)
-    table.insert(lines, "")  -- spacer
-    
+    table.insert(highlights, { line = stats_line, group = "DiagnosticOk" })
+    table.insert(lines, "") -- spacer
+
     computed_width = math.max(computed_width, #fname + 2, #ranges + 2, #stat_line + 2)
   end
 
   local width = math.min(computed_width, M.config.max_width)
+  for i, line in ipairs(lines) do
+    lines[i] = fit(line, width)
+  end
 
   -- Ensure scratch buffer exists
   if not M.bufnr or not vim.api.nvim_buf_is_valid(M.bufnr) then
@@ -109,26 +131,22 @@ function M.update()
 
   -- Apply highlights
   vim.api.nvim_buf_clear_namespace(M.bufnr, HUD_HL_NS, 0, -1)
-  vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Title",   0, 0, -1)
-  vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Comment", 1, 0, -1)
-
-  local li = 2
-  for _ = 1, #active do
-    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Directory",     li,     0, -1)  -- filename
-    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "Number",        li + 1, 0, -1)  -- line ranges
-    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, "DiagnosticOk",  li + 2, 0, -1)  -- stats
-    li = li + 4  -- filename + ranges + stats + spacer
+  for _, hl in ipairs(highlights) do
+    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, hl.group, hl.line, 0, -1)
   end
 
   -- Window config
-  local col = (M.config.position == "top_right") and (vim.o.columns - width - 3) or 3
+  local right = M.config.position == "top_right" or M.config.position == "bottom_right"
+  local bottom = M.config.position == "bottom_left" or M.config.position == "bottom_right"
+  local col = right and (vim.o.columns - width - 3) or 3
+  local row = bottom and math.max(1, vim.o.lines - #lines - 4) or 1
   local win_opts = {
     relative  = "editor",
     width     = width,
     height    = #lines,
     col       = col,
-    row       = 1,
-    anchor    = (M.config.position == "top_right") and "NE" or "NW",
+    row       = row,
+    anchor    = right and "NE" or "NW",
     style     = "minimal",
     border    = M.config.border,
     focusable = false,

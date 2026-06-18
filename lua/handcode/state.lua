@@ -1,6 +1,6 @@
 --- handcode/state.lua
 --- Session state, extmark management, and type-over listener.
---- Type-over uses on_lines + common-prefix comparison (no on_bytes overwrite hack).
+--- Type-over uses on_lines to normalize matching inserts (no on_bytes overwrite hack).
 
 local M = {}
 local diff_mod = require("handcode.diff")
@@ -15,7 +15,8 @@ M.ns_ghost = vim.api.nvim_create_namespace("handcode_ghosts")
 ---@field additions      string[]   target lines (what the AI wrote)
 ---@field deletions      string[]   original lines being replaced
 ---@field solidified_lines table<number, boolean>  1-indexed: true = done
----@field solidified_col  number    byte col up to which the active line is solidified
+---@field solidified_cols table<number, number>    1-indexed byte col completed per line
+---@field solidified_col  number    byte col completed on the active line, kept for compatibility
 ---@field resolved        boolean
 
 ---@class handcode.Session
@@ -47,18 +48,52 @@ local function get_active_line(hunk)
   return nil
 end
 
----Byte length of the longest common prefix of two strings.
----@param a string
----@param b string
+---@param hunk handcode.GhostHunk
+---@param line_idx number
 ---@return number
-local function common_prefix_len(a, b)
-  local limit = math.min(#a, #b)
-  for i = 1, limit do
-    if a:sub(i, i) ~= b:sub(i, i) then
-      return i - 1
+local function get_solidified_col(hunk, line_idx)
+  return hunk.solidified_cols and hunk.solidified_cols[line_idx] or hunk.solidified_col or 0
+end
+
+---@param hunk handcode.GhostHunk
+---@param line_idx number
+---@param col number
+local function set_solidified_col(hunk, line_idx, col)
+  hunk.solidified_cols = hunk.solidified_cols or {}
+  hunk.solidified_cols[line_idx] = col
+  if get_active_line(hunk) == line_idx then
+    hunk.solidified_col = col
+  end
+end
+
+---@param bufnr number
+---@param hunk handcode.GhostHunk
+---@return number?
+local function get_hunk_start(bufnr, hunk)
+  local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns_id, hunk.extmark_id, { details = true })
+  if not pos or not pos[1] then return nil end
+  return pos[1]
+end
+
+---@param bufnr number
+---@param hunk handcode.GhostHunk
+---@return number?, number?
+local function get_hunk_bounds(bufnr, hunk)
+  local add_start = get_hunk_start(bufnr, hunk)
+  if not add_start then return nil, nil end
+
+  local start_row = add_start
+  local end_row = add_start + math.max(#hunk.additions, 1) - 1
+
+  if hunk.del_extmark_id then
+    local del_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns_id, hunk.del_extmark_id, { details = true })
+    if del_pos and del_pos[1] and del_pos[3] then
+      start_row = math.min(start_row, del_pos[1])
+      end_row = math.max(end_row, del_pos[3].end_row - 1)
     end
   end
-  return limit
+
+  return start_row, end_row
 end
 
 ---Resolve a hunk's deletion block: remove the restored lines from the buffer.
@@ -97,23 +132,107 @@ local function resolve_additions(bufnr, hunk, session)
   end
   hunk.additions = {}
   hunk.solidified_lines = {}
+  hunk.solidified_cols = {}
   hunk.solidified_col = 0
+end
+
+---When the user types matching text at the start of the ghost segment, remove
+---the duplicated ghost bytes after the cursor so insert mode behaves like type-over.
+---@param bufnr number
+---@param hunk handcode.GhostHunk
+---@param line_idx number
+---@param row number
+---@return boolean handled
+local function normalize_typeover_line(bufnr, hunk, line_idx, row)
+  local target = hunk.additions[line_idx]
+  if not target then return false end
+
+  local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
+  if not line then
+    hunk.solidified_lines[line_idx] = true
+    return true
+  end
+
+  local old_col = get_solidified_col(hunk, line_idx)
+
+  if line == target then
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local cursor_col = cursor[1] - 1 == row and cursor[2] or old_col
+    if cursor_col > old_col and line:sub(1, cursor_col) == target:sub(1, cursor_col) then
+      set_solidified_col(hunk, line_idx, math.min(cursor_col, #target))
+      if cursor_col >= #target then
+        hunk.solidified_lines[line_idx] = true
+      end
+      return true
+    end
+    return false
+  end
+
+  for typed_len = #target - old_col, 1, -1 do
+    local new_col = old_col + typed_len
+    local expected_line = target:sub(1, new_col) .. target:sub(old_col + 1)
+    if line == expected_line then
+      vim.api.nvim_buf_set_text(bufnr, row, new_col, row, new_col + typed_len, {})
+      set_solidified_col(hunk, line_idx, math.min(new_col, #target))
+      if new_col >= #target then
+        hunk.solidified_lines[line_idx] = true
+      end
+      return true
+    end
+  end
+
+  hunk.solidified_lines[line_idx] = true
+  return true
+end
+
+---@param bufnr number
+---@param first number
+---@param last_new number
+local function handle_user_lines(bufnr, first, last_new)
+  local session = M.sessions[bufnr]
+  if not session then return end
+
+  local changed_last = math.max(first, last_new - 1)
+  for _, hunk in ipairs(session.ghost_hunks) do
+    if hunk.resolved or #hunk.additions == 0 then goto continue end
+
+    local start_row = get_hunk_start(bufnr, hunk)
+    if not start_row then
+      hunk.resolved = true
+      goto continue
+    end
+
+    local end_row = start_row + #hunk.additions - 1
+    if changed_last < start_row or first > end_row then goto continue end
+
+    local active_idx = get_active_line(hunk)
+    for row = math.max(first, start_row), math.min(changed_last, end_row) do
+      local line_idx = row - start_row + 1
+      if not hunk.solidified_lines[line_idx] then
+        if line_idx == active_idx and normalize_typeover_line(bufnr, hunk, line_idx, row) then
+          -- handled as matching type-over or intentional line edit
+        else
+          hunk.solidified_lines[line_idx] = true
+        end
+      end
+    end
+
+    ::continue::
+  end
 end
 
 -- ─── render ─────────────────────────────────────────────────────────────────
 
 ---Recompute solidification state for a hunk from the current buffer content,
----then repaint the ghost highlight extmarks.
----Uses common-prefix comparison — no on_bytes required.
+---then repaint the ghost highlight extmarks. No on_bytes callback is required.
 ---@param bufnr number
 ---@param hunk  handcode.GhostHunk
 local function sync_and_paint_hunk(bufnr, hunk)
-  local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns_id, hunk.extmark_id, {})
-  if not pos or not pos[1] then
+  local start_row = get_hunk_start(bufnr, hunk)
+  if not start_row then
     hunk.resolved = true
     return
   end
-  local start_row = pos[1]
 
   local buf_lines = vim.api.nvim_buf_get_lines(
     bufnr, start_row, start_row + #hunk.additions, false
@@ -125,6 +244,7 @@ local function sync_and_paint_hunk(bufnr, hunk)
 
     local buf_line = buf_lines[i]
     local target   = hunk.additions[i]
+    local solidified_col = get_solidified_col(hunk, i)
 
     if buf_line == nil then
       -- line was deleted — count as solidified
@@ -132,36 +252,20 @@ local function sync_and_paint_hunk(bufnr, hunk)
       goto continue
     end
 
-    if buf_line == target then
+    if solidified_col >= #target then
       hunk.solidified_lines[i] = true
       goto continue
     end
 
-    -- Compute how far the user has typed (common prefix length)
-    local prefix = common_prefix_len(buf_line, target)
-
-    -- If this is the active (first un-solidified) line, update solidified_col
-    local active_idx = get_active_line(hunk)
-    if active_idx == i then
-      -- If the already-solidified portion has been edited (prefix retreated), solidify whole line
-      if prefix < hunk.solidified_col then
-        hunk.solidified_lines[i] = true
-        goto continue
-      end
-      hunk.solidified_col = prefix
-    else
-      -- Non-active lines: any edit at all solidifies them
-      if prefix < #target then
-        -- User edited a non-active line — solidify it
-        hunk.solidified_lines[i] = true
-        goto continue
-      end
+    if buf_line ~= target then
+      hunk.solidified_lines[i] = true
+      goto continue
     end
 
     all_done = false
 
     -- Paint ghost highlight from solidified_col (or 0 for non-active) to end of target
-    local paint_from = (active_idx == i) and hunk.solidified_col or 0
+    local paint_from = solidified_col
     local paint_to   = math.min(#buf_line, #target)
     if paint_to > paint_from then
       vim.api.nvim_buf_set_extmark(bufnr, M.ns_ghost, start_row + i - 1, paint_from, {
@@ -243,6 +347,10 @@ end
 ---Start a Handcode session for bufnr.
 ---@param bufnr number
 function M.start_session(bufnr)
+  if not bufnr or bufnr == 0 then
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+
   if M.sessions[bufnr] then
     vim.notify("Handcode: already active in this buffer", vim.log.levels.INFO)
     return
@@ -297,8 +405,10 @@ function M.start_session(bufnr)
     local del_extmark_id = nil
     if hunk.del_len > 0 then
       del_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, M.ns_id, del_start_row, 0, {
-        end_row  = del_start_row + hunk.del_len,
-        hl_group = "HandcodeDelete",
+        end_row           = del_start_row + hunk.del_len,
+        right_gravity     = false,
+        end_right_gravity = false,
+        hl_group          = "HandcodeDelete",
       })
       for i = 0, hunk.del_len - 1 do
         vim.api.nvim_buf_set_extmark(bufnr, M.ns_id, del_start_row + i, 0, {
@@ -314,6 +424,7 @@ function M.start_session(bufnr)
       additions       = hunk.additions,
       deletions       = hunk.deletions,
       solidified_lines = {},
+      solidified_cols  = {},
       solidified_col  = 0,
       resolved        = false,
     })
@@ -350,6 +461,11 @@ function M.start_session(bufnr)
       end
 
       vim.schedule(function()
+        local current = M.sessions[b]
+        if not current then return end
+        current.is_updating = true
+        handle_user_lines(b, first, last_new)
+        current.is_updating = false
         M.render_buffer(b)
       end)
     end,
@@ -386,7 +502,6 @@ function M.stop_session(bufnr, restore)
   end
 
   M.sessions[bufnr] = nil
-  require("handcode.detect").unwatch_buf(bufnr)
   require("handcode.hud").update()
 end
 
@@ -415,8 +530,9 @@ function M.accept_current_line()
       session.is_updating = false
 
       hunk.solidified_lines[active_idx] = true
+      set_solidified_col(hunk, active_idx, #target)
       hunk.solidified_col = 0
-      vim.api.nvim_win_set_cursor(0, { cursor_row + 1, math.max(0, #target - 1) })
+      vim.api.nvim_win_set_cursor(0, { cursor_row + 1, #target })
 
       vim.schedule(function() M.render_buffer(bufnr) end)
       return true
@@ -437,11 +553,8 @@ function M.resolve_hunk_at(bufnr, cursor_row)
   for _, hunk in ipairs(session.ghost_hunks) do
     if hunk.resolved then goto continue end
 
-    local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns_id, hunk.extmark_id, {})
-    if not (pos and pos[1]) then goto continue end
-
-    local hunk_start = pos[1]
-    local hunk_end   = hunk_start + math.max(#hunk.additions, 1) - 1
+    local hunk_start, hunk_end = get_hunk_bounds(bufnr, hunk)
+    if not hunk_start or not hunk_end then goto continue end
 
     if cursor_row >= hunk_start and cursor_row <= hunk_end then
       resolve_deletions(bufnr, hunk, session)
@@ -469,11 +582,8 @@ function M.resolve_range(bufnr, start_row, end_row)
   for _, hunk in ipairs(session.ghost_hunks) do
     if hunk.resolved then goto continue end
 
-    local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns_id, hunk.extmark_id, {})
-    if not (pos and pos[1]) then goto continue end
-
-    local hs = pos[1]
-    local he = hs + math.max(#hunk.additions, 1) - 1
+    local hs, he = get_hunk_bounds(bufnr, hunk)
+    if not hs or not he then goto continue end
 
     if not (he < start_row or hs > end_row) then
       resolve_deletions(bufnr, hunk, session)
