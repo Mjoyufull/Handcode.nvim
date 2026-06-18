@@ -121,4 +121,39 @@ function M.get_file_diff(filepath)
   return hunks
 end
 
+---@param cwd string?
+---@return string[]
+function M.list_changed_files(cwd)
+  cwd = cwd and cwd ~= "" and cwd or vim.fn.getcwd()
+
+  local root = vim.fn.systemlist({ "git", "-C", cwd, "rev-parse", "--show-toplevel" })
+  if vim.v.shell_error ~= 0 or not root[1] or root[1] == "" then
+    return {}
+  end
+
+  local status = vim.fn.systemlist({ "git", "-C", root[1], "status", "--porcelain", "--untracked-files=normal" })
+  if vim.v.shell_error ~= 0 then
+    return {}
+  end
+
+  local files = {}
+  for _, line in ipairs(status) do
+    local code = line:sub(1, 2)
+    local path = line:sub(4)
+
+    if path:find(" -> ", 1, true) then
+      path = path:match(" %-> (.+)$") or path
+    end
+
+    if path ~= "" and not code:match("D") then
+      local fullpath = root[1]:gsub("/$", "") .. "/" .. path
+      if vim.fn.filereadable(fullpath) == 1 then
+        table.insert(files, fullpath)
+      end
+    end
+  end
+
+  return files
+end
+
 return M

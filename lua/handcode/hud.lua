@@ -25,6 +25,41 @@ local function fit(text, width)
   return text:sub(1, width - 1) .. "…"
 end
 
+---@param bufnr number
+---@param state table
+---@param hunk table
+---@return number
+local function remaining_deletions(bufnr, state, hunk)
+  if not hunk.del_extmark_id then return 0 end
+
+  local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, hunk.del_extmark_id, { details = true })
+  if not pos or not pos[1] or not pos[3] then return 0 end
+
+  return math.max(0, pos[3].end_row - pos[1])
+end
+
+---@param bufnr number
+---@param state table
+---@param hunk table
+---@return string?
+local function hunk_range(bufnr, state, hunk)
+  local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, hunk.extmark_id, { details = true })
+  if not pos or not pos[1] then return nil end
+
+  local start_row = pos[1]
+  local end_row = pos[1] + math.max(#hunk.additions, 1) - 1
+
+  if hunk.del_extmark_id then
+    local del_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, hunk.del_extmark_id, { details = true })
+    if del_pos and del_pos[1] and del_pos[3] then
+      start_row = math.min(start_row, del_pos[1])
+      end_row = math.max(end_row, del_pos[3].end_row - 1)
+    end
+  end
+
+  return string.format("L%d-%d", start_row + 1, end_row + 1)
+end
+
 ---Close the HUD window.
 function M.close()
   if M.win_id and vim.api.nvim_win_is_valid(M.win_id) then
@@ -79,26 +114,23 @@ function M.update()
     
     for _, hunk in ipairs(session.ghost_hunks) do
       if not hunk.resolved then
-        -- Get extmark position to show line numbers
-        local pos = vim.api.nvim_buf_get_extmark_by_id(
-          item.bufnr, state.ns_id, hunk.extmark_id, {}
-        )
-        if pos and pos[1] then
-          local start_line = pos[1] + 1  -- convert to 1-indexed
-          local end_line = start_line + math.max(#hunk.additions, #hunk.deletions) - 1
-          table.insert(line_ranges, string.format("L%d-%d", start_line, end_line))
+        local range = hunk_range(item.bufnr, state, hunk)
+        if range then
+          table.insert(line_ranges, range)
         end
-        
+
         for i = 1, #hunk.additions do
           if not hunk.solidified_lines[i] then adds = adds + 1 end
         end
-        dels = dels + #hunk.deletions
+        dels = dels + remaining_deletions(item.bufnr, state, hunk)
       end
     end
 
     local fname = "  " .. session.file
     local ranges = "    " .. table.concat(line_ranges, ", ")
     local stat_line = string.format("    +%d  -%d", adds, dels)
+    local plus_start, plus_end = stat_line:find("%+%d+")
+    local minus_start, minus_end = stat_line:find("%-%d+")
 
     local filename_line = #lines
     table.insert(lines, fname)
@@ -110,7 +142,18 @@ function M.update()
     end
     local stats_line = #lines
     table.insert(lines, stat_line)
-    table.insert(highlights, { line = stats_line, group = "DiagnosticOk" })
+    table.insert(highlights, {
+      line = stats_line,
+      group = adds > 0 and "DiagnosticOk" or "Comment",
+      start_col = plus_start and plus_start - 1 or 0,
+      end_col = plus_end or -1,
+    })
+    table.insert(highlights, {
+      line = stats_line,
+      group = dels > 0 and "HandcodeDelete" or "Comment",
+      start_col = minus_start and minus_start - 1 or 0,
+      end_col = minus_end or -1,
+    })
     table.insert(lines, "") -- spacer
 
     computed_width = math.max(computed_width, #fname + 2, #ranges + 2, #stat_line + 2)
@@ -132,7 +175,7 @@ function M.update()
   -- Apply highlights
   vim.api.nvim_buf_clear_namespace(M.bufnr, HUD_HL_NS, 0, -1)
   for _, hl in ipairs(highlights) do
-    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, hl.group, hl.line, 0, -1)
+    vim.api.nvim_buf_add_highlight(M.bufnr, HUD_HL_NS, hl.group, hl.line, hl.start_col or 0, hl.end_col or -1)
   end
 
   -- Window config

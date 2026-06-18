@@ -15,9 +15,9 @@ M.config = {
     max_width = 30,
   },
   keymaps = {
-    accept_line   = "<Tab>",
-    complete_hunk = "<leader>hc",
-    complete_file = "<leader>hf",
+    accept_line   = false,
+    complete_hunk = false,
+    complete_file = false,
   },
   detection = {
     opencode_events = true,  -- hook into OpencodeEvent:* autocmds
@@ -108,7 +108,7 @@ function M.start(bufnr)
 
   local km = M.config.keymaps
 
-  if km.accept_line then
+  if type(km.accept_line) == "string" and km.accept_line ~= "" then
     -- Insert-mode: accept/complete the current ghost line.
     -- expr = true so we can fall through to a real <Tab> when not on a ghost line.
     vim.keymap.set("i", km.accept_line, function()
@@ -119,13 +119,13 @@ function M.start(bufnr)
     end, { buffer = bufnr, expr = true, replace_keycodes = true, desc = "Handcode: accept ghost line" })
   end
 
-  if km.complete_hunk then
+  if type(km.complete_hunk) == "string" and km.complete_hunk ~= "" then
     vim.keymap.set("n", km.complete_hunk, function()
       M.complete_hunk()
     end, { buffer = bufnr, desc = "Handcode: complete hunk" })
   end
 
-  if km.complete_file then
+  if type(km.complete_file) == "string" and km.complete_file ~= "" then
     vim.keymap.set("n", km.complete_file, function()
       M.complete_file()
     end, { buffer = bufnr, desc = "Handcode: complete file" })
@@ -138,9 +138,15 @@ function M.stop(restore)
   local bufnr = vim.api.nvim_get_current_buf()
   local km    = M.config.keymaps
 
-  pcall(vim.keymap.del, "i", km.accept_line   or "", { buffer = bufnr })
-  pcall(vim.keymap.del, "n", km.complete_hunk or "", { buffer = bufnr })
-  pcall(vim.keymap.del, "n", km.complete_file or "", { buffer = bufnr })
+  if type(km.accept_line) == "string" then
+    pcall(vim.keymap.del, "i", km.accept_line, { buffer = bufnr })
+  end
+  if type(km.complete_hunk) == "string" then
+    pcall(vim.keymap.del, "n", km.complete_hunk, { buffer = bufnr })
+  end
+  if type(km.complete_file) == "string" then
+    pcall(vim.keymap.del, "n", km.complete_file, { buffer = bufnr })
+  end
 
   require("handcode.state").stop_session(bufnr, restore or false)
 end

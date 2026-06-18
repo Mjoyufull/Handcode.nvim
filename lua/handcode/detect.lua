@@ -10,6 +10,7 @@ local M = {}
 
 ---@type table<number, uv_fs_event_t>  bufnr -> active watcher handle
 local watchers = {}
+local try_start
 
 ---@param filepath string
 ---@return string
@@ -82,9 +83,30 @@ local function resolve_event_filepath(filepath)
   return filepath
 end
 
+---@return string[]
+local function scan_roots()
+  local roots = { vim.fn.getcwd() }
+  local ok, server_mod = pcall(require, "opencode.server")
+  local connected = ok and server_mod.connected or nil
+  if connected and connected.cwd and connected.cwd ~= "" then
+    table.insert(roots, connected.cwd)
+  end
+  return roots
+end
+
+---@param cwd string?
+local function scan_changed_files(cwd)
+  local diff = require("handcode.diff")
+  for _, filepath in ipairs(diff.list_changed_files(cwd)) do
+    local bufnr = find_or_load_buf(filepath)
+    checktime(bufnr)
+    try_start(bufnr)
+  end
+end
+
 ---Attempt to start a Handcode session on bufnr if it has new diff and no active session.
 ---@param bufnr number
-local function try_start(bufnr)
+function try_start(bufnr)
   if not vim.api.nvim_buf_is_valid(bufnr) then return end
   if not vim.api.nvim_buf_is_loaded(bufnr) then return end
 
@@ -165,7 +187,7 @@ function M.setup(config)
         end
 
         -- Defer so opencode.nvim's :checktime reload runs first
-        vim.defer_fn(function()
+        vim.schedule(function()
           -- If we know which file was edited, ensure buffer is loaded
           if edited_file and vim.fn.filereadable(edited_file) == 1 then
             local target_bufnr = find_or_load_buf(edited_file)
@@ -178,7 +200,11 @@ function M.setup(config)
             -- Try to start handcode on this buffer after a small delay
             vim.defer_fn(function()
               try_start(target_bufnr)
-            end, 100)
+            end, 30)
+          end
+
+          for _, root in ipairs(scan_roots()) do
+            scan_changed_files(root)
           end
 
           -- Also try the current buffer
@@ -193,7 +219,7 @@ function M.setup(config)
               try_start(b)
             end
           end
-        end, 200)
+        end)
       end,
     })
 
@@ -211,6 +237,10 @@ function M.setup(config)
         if event.type ~= "session.idle" and status ~= "idle" then return end
 
         vim.schedule(function()
+          for _, root in ipairs(scan_roots()) do
+            scan_changed_files(root)
+          end
+
           for _, b in ipairs(vim.api.nvim_list_bufs()) do
             if vim.api.nvim_buf_is_loaded(b) then
               checktime(b)

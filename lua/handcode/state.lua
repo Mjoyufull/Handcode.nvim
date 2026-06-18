@@ -12,8 +12,10 @@ M.ns_ghost = vim.api.nvim_create_namespace("handcode_ghosts")
 ---@class handcode.GhostHunk
 ---@field extmark_id     number     extmark tracking the addition block start row
 ---@field del_extmark_id number?    extmark tracking the deletion block
----@field additions      string[]   target lines (what the AI wrote)
----@field deletions      string[]   original lines being replaced
+---@field additions      string[]   target lines still awaiting handcoding
+---@field deletions      string[]   restored original lines still awaiting removal
+---@field original_additions string[] all target lines, kept for stats/debugging
+---@field original_deletions string[] all restored lines, kept for stats/debugging
 ---@field solidified_lines table<number, boolean>  1-indexed: true = done
 ---@field solidified_cols table<number, number>    1-indexed byte col completed per line
 ---@field solidified_col  number    byte col completed on the active line, kept for compatibility
@@ -187,12 +189,18 @@ end
 
 ---@param bufnr number
 ---@param first number
+---@param last_old number
 ---@param last_new number
-local function handle_user_lines(bufnr, first, last_new)
+local function handle_user_lines(bufnr, first, last_old, last_new)
   local session = M.sessions[bufnr]
   if not session then return end
 
-  local changed_last = math.max(first, last_new - 1)
+  -- Only a single-row text edit can handcode ghost text. Structural edits such
+  -- as Enter, joins, moves, and multi-line paste should not accept anything.
+  if last_old ~= first + 1 or last_new ~= first + 1 then
+    return
+  end
+
   for _, hunk in ipairs(session.ghost_hunks) do
     if hunk.resolved or #hunk.additions == 0 then goto continue end
 
@@ -203,17 +211,15 @@ local function handle_user_lines(bufnr, first, last_new)
     end
 
     local end_row = start_row + #hunk.additions - 1
-    if changed_last < start_row or first > end_row then goto continue end
+    if first < start_row or first > end_row then goto continue end
 
     local active_idx = get_active_line(hunk)
-    for row = math.max(first, start_row), math.min(changed_last, end_row) do
-      local line_idx = row - start_row + 1
-      if not hunk.solidified_lines[line_idx] then
-        if line_idx == active_idx and normalize_typeover_line(bufnr, hunk, line_idx, row) then
-          -- handled as matching type-over or intentional line edit
-        else
-          hunk.solidified_lines[line_idx] = true
-        end
+    local line_idx = first - start_row + 1
+    if not hunk.solidified_lines[line_idx] then
+      if line_idx == active_idx and normalize_typeover_line(bufnr, hunk, line_idx, first) then
+        -- handled as matching type-over or intentional line edit
+      else
+        hunk.solidified_lines[line_idx] = true
       end
     end
 
@@ -247,8 +253,7 @@ local function sync_and_paint_hunk(bufnr, hunk)
     local solidified_col = get_solidified_col(hunk, i)
 
     if buf_line == nil then
-      -- line was deleted — count as solidified
-      hunk.solidified_lines[i] = true
+      all_done = false
       goto continue
     end
 
@@ -258,7 +263,7 @@ local function sync_and_paint_hunk(bufnr, hunk)
     end
 
     if buf_line ~= target then
-      hunk.solidified_lines[i] = true
+      all_done = false
       goto continue
     end
 
@@ -423,6 +428,8 @@ function M.start_session(bufnr)
       del_extmark_id  = del_extmark_id,
       additions       = hunk.additions,
       deletions       = hunk.deletions,
+      original_additions = vim.deepcopy(hunk.additions),
+      original_deletions = vim.deepcopy(hunk.deletions),
       solidified_lines = {},
       solidified_cols  = {},
       solidified_col  = 0,
@@ -464,7 +471,7 @@ function M.start_session(bufnr)
         local current = M.sessions[b]
         if not current then return end
         current.is_updating = true
-        handle_user_lines(b, first, last_new)
+        handle_user_lines(b, first, last_old, last_new)
         current.is_updating = false
         M.render_buffer(b)
       end)
