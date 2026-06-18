@@ -121,6 +121,23 @@ function M.get_file_diff(filepath)
   return hunks
 end
 
+---@param hunks handcode.Hunk[]?
+---@return string
+function M.fingerprint(hunks)
+  if not hunks then return "" end
+
+  local parts = {}
+  for _, hunk in ipairs(hunks) do
+    table.insert(parts, table.concat({ hunk.del_start, hunk.del_len, hunk.add_start, hunk.add_len }, ":"))
+    table.insert(parts, table.concat(hunk.deletions, "\n"))
+    table.insert(parts, "\0")
+    table.insert(parts, table.concat(hunk.additions, "\n"))
+    table.insert(parts, "\0")
+  end
+
+  return table.concat(parts, "\1")
+end
+
 ---@param cwd string?
 ---@return string[]
 function M.list_changed_files(cwd)

@@ -28,9 +28,35 @@ M.ns_ghost = vim.api.nvim_create_namespace("handcode_ghosts")
 ---@field ai_lines       string[]   buffer snapshot when session started (AI version)
 ---@field original_lines string[]   buffer snapshot after deletions restored
 ---@field is_updating    boolean    re-entrancy guard
+---@field filepath       string
+---@field fingerprint    string
 
 ---@type table<number, handcode.Session>
 M.sessions = {}
+
+---@type table<string, string>
+M.completed_diffs = {}
+
+---@param filepath string
+---@return string
+local function normalize_path(filepath)
+  return vim.fn.fnamemodify(filepath, ":p")
+end
+
+---@param filepath string
+---@param hunks handcode.Hunk[]?
+---@return boolean
+function M.is_completed_diff(filepath, hunks)
+  local fingerprint = diff_mod.fingerprint(hunks)
+  return fingerprint ~= "" and M.completed_diffs[normalize_path(filepath)] == fingerprint
+end
+
+---@param session handcode.Session
+local function mark_completed_diff(session)
+  if session.fingerprint and session.fingerprint ~= "" then
+    M.completed_diffs[normalize_path(session.filepath)] = session.fingerprint
+  end
+end
 
 -- Default highlights (overridden by setup via init.lua)
 vim.api.nvim_set_hl(0, "HandcodeGhost",  { link = "Comment",    default = true })
@@ -151,8 +177,7 @@ local function normalize_typeover_line(bufnr, hunk, line_idx, row)
 
   local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
   if not line then
-    hunk.solidified_lines[line_idx] = true
-    return true
+    return false
   end
 
   local old_col = get_solidified_col(hunk, line_idx)
@@ -183,8 +208,7 @@ local function normalize_typeover_line(bufnr, hunk, line_idx, row)
     end
   end
 
-  hunk.solidified_lines[line_idx] = true
-  return true
+  return false
 end
 
 ---@param bufnr number
@@ -217,9 +241,7 @@ local function handle_user_lines(bufnr, first, last_old, last_new)
     local line_idx = first - start_row + 1
     if not hunk.solidified_lines[line_idx] then
       if line_idx == active_idx and normalize_typeover_line(bufnr, hunk, line_idx, first) then
-        -- handled as matching type-over or intentional line edit
-      else
-        hunk.solidified_lines[line_idx] = true
+        -- handled as matching type-over
       end
     end
 
@@ -333,6 +355,7 @@ function M.render_buffer(bufnr)
   require("handcode.hud").update()
 
   if M.is_session_resolved(session) then
+    mark_completed_diff(session)
     vim.notify("Handcode: All changes handcoded!", vim.log.levels.INFO)
     M.stop_session(bufnr, false)
   end
@@ -377,7 +400,9 @@ function M.start_session(bufnr)
 
   local session = {
     bufnr          = bufnr,
+    filepath       = filepath,
     file           = vim.fn.fnamemodify(filepath, ":t"),
+    fingerprint    = diff_mod.fingerprint(hunks),
     ghost_hunks    = {},
     ai_lines       = ai_lines,
     original_lines = {},

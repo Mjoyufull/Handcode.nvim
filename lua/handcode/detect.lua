@@ -121,7 +121,21 @@ function try_start(bufnr)
 
   local hunks = require("handcode.diff").get_file_diff(filepath)
   if hunks and #hunks > 0 then
+    if state.is_completed_diff(filepath, hunks) then return end
     require("handcode").start(bufnr)
+  end
+end
+
+local function scan_all_changed_files()
+  for _, root in ipairs(scan_roots()) do
+    scan_changed_files(root)
+  end
+end
+
+local function schedule_changed_file_scans()
+  vim.schedule(scan_all_changed_files)
+  for _, delay in ipairs({ 80, 250, 600 }) do
+    vim.defer_fn(scan_all_changed_files, delay)
   end
 end
 
@@ -203,9 +217,7 @@ function M.setup(config)
             end, 30)
           end
 
-          for _, root in ipairs(scan_roots()) do
-            scan_changed_files(root)
-          end
+          schedule_changed_file_scans()
 
           -- Also try the current buffer
           local bufnr = vim.api.nvim_get_current_buf()
@@ -237,9 +249,7 @@ function M.setup(config)
         if event.type ~= "session.idle" and status ~= "idle" then return end
 
         vim.schedule(function()
-          for _, root in ipairs(scan_roots()) do
-            scan_changed_files(root)
-          end
+          scan_all_changed_files()
 
           for _, b in ipairs(vim.api.nvim_list_bufs()) do
             if vim.api.nvim_buf_is_loaded(b) then
