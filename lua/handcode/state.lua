@@ -80,7 +80,7 @@ end
 ---@param line_idx number
 ---@return number
 local function get_solidified_col(hunk, line_idx)
-  return hunk.solidified_cols and hunk.solidified_cols[line_idx] or hunk.solidified_col or 0
+  return hunk.solidified_cols and hunk.solidified_cols[line_idx] or 0
 end
 
 ---@param hunk handcode.GhostHunk
